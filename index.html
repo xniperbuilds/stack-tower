@@ -12,7 +12,7 @@
 <!-- ═══════════ FIREBASE ═══════════ -->
 <script type="module">
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-import { getDatabase, ref, push, query, orderByChild, limitToLast, get, onValue, startAt }
+import { getDatabase, ref, push, query, orderByChild, limitToLast, get, onValue, off }
   from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
 
 const firebaseConfig = {
@@ -38,6 +38,18 @@ window._fbSubmit = async (username, score, bestCombo, themeReached, mode) => {
   } catch(e){ console.warn('Submit failed:', e); return false; }
 };
 
+// Dedupe by username - keep highest score per user
+function dedupeByUser(rows) {
+  const bestByUser = new Map();
+  for (const r of rows) {
+    const existing = bestByUser.get(r.username);
+    if (!existing || r.score > existing.score) {
+      bestByUser.set(r.username, r);
+    }
+  }
+  return Array.from(bestByUser.values()).sort((a,b) => b.score - a.score);
+}
+
 window._fbFetch = async (mode='all') => {
   try {
     const now = Date.now();
@@ -47,15 +59,47 @@ window._fbFetch = async (mode='all') => {
     if (mode === 'today') minTs = now - dayMs;
     else if (mode === 'week') minTs = now - weekMs;
 
-    const q = query(ref(db,'leaderboard_stacktower'), orderByChild('score'), limitToLast(200));
+    const q = query(ref(db,'leaderboard_stacktower'), orderByChild('score'), limitToLast(500));
     const snap = await get(q);
     const rows = [];
     snap.forEach(c => {
       const v = c.val();
       if (v.ts >= minTs) rows.push(v);
     });
-    return rows.sort((a,b) => b.score - a.score).slice(0, 50);
+    return dedupeByUser(rows).slice(0, 50);
   } catch(e){ console.warn('Fetch failed:', e); return null; }
+};
+
+// Real-time subscription
+let _fbUnsubscribe = null;
+window._fbSubscribe = (mode, callback) => {
+  if (_fbUnsubscribe) { _fbUnsubscribe(); _fbUnsubscribe = null; }
+  try {
+    const q = query(ref(db,'leaderboard_stacktower'), orderByChild('score'), limitToLast(500));
+    const handler = (snap) => {
+      const now = Date.now();
+      const dayMs = 86400000;
+      const weekMs = dayMs * 7;
+      let minTs = 0;
+      if (mode === 'today') minTs = now - dayMs;
+      else if (mode === 'week') minTs = now - weekMs;
+      const rows = [];
+      snap.forEach(c => {
+        const v = c.val();
+        if (v.ts >= minTs) rows.push(v);
+      });
+      callback(dedupeByUser(rows).slice(0, 50));
+    };
+    onValue(q, handler);
+    _fbUnsubscribe = () => off(q, 'value', handler);
+  } catch(e){
+    console.warn('Subscribe failed:', e);
+    callback(null);
+  }
+};
+
+window._fbUnsubscribe = () => {
+  if (_fbUnsubscribe) { _fbUnsubscribe(); _fbUnsubscribe = null; }
 };
 </script>
 
@@ -224,6 +268,17 @@ body{position:fixed;inset:0;touch-action:manipulation;
 @keyframes cutFall{
   0%{transform:translateY(0) rotate(0);opacity:1;}
   100%{transform:translateY(120vh) rotate(540deg);opacity:0;}
+}
+
+/* Edge guide lines */
+.guide-line{position:absolute;width:2px;
+  background:linear-gradient(180deg,rgba(255,215,0,.8),rgba(255,215,0,0));
+  box-shadow:0 0 8px rgba(255,215,0,.6);
+  pointer-events:none;z-index:6;
+  animation:guidePulse 1.5s ease-in-out infinite;}
+@keyframes guidePulse{
+  0%,100%{opacity:.5;}
+  50%{opacity:1;}
 }
 
 /* ── PARTICLES ───────────────────────────────── */
@@ -1131,14 +1186,28 @@ let user = null;
 
 function loadUser(){
   try {
-    const u = JSON.parse(localStorage.getItem('xb_st_user') || 'null');
-    if (u && u.name && u.tag) user = u;
-  } catch(e){}
+    const raw = localStorage.getItem('xb_st_user');
+    if (!raw) return;
+    const u = JSON.parse(raw);
+    if (u && typeof u.name === 'string' && typeof u.tag === 'string' && u.name.length >= 2) {
+      // Always reconstruct full field for safety
+      u.full = `${u.name}#${u.tag}`;
+      user = u;
+    }
+  } catch(e){ console.warn('Load user failed:', e); }
 }
 
 function saveUser(u){
   user = u;
-  try { localStorage.setItem('xb_st_user', JSON.stringify(u)); } catch(e){}
+  try {
+    localStorage.setItem('xb_st_user', JSON.stringify(u));
+    // Verify save worked
+    const check = localStorage.getItem('xb_st_user');
+    if (!check) throw new Error('Save not persisted');
+  } catch(e){
+    console.warn('Save user failed:', e);
+    showToast('⚠ Could not save name (private mode?)');
+  }
   updateUserPill();
 }
 
@@ -1912,8 +1981,10 @@ async function openLB(){
   loadLeaderboard();
 }
 function closeLB(e){
-  if (!e || e.target === document.getElementById('lbModal'))
+  if (!e || e.target === document.getElementById('lbModal')) {
     document.getElementById('lbModal').classList.remove('show');
+    if (window._fbUnsubscribe) window._fbUnsubscribe();
+  }
 }
 function switchLB(tab){
   lbCurrentTab = tab;
@@ -1923,14 +1994,20 @@ function switchLB(tab){
   loadLeaderboard();
 }
 
-async function loadLeaderboard(){
+function loadLeaderboard(){
   const list = document.getElementById('lbList');
   list.innerHTML = '<div class="lb-loading">Loading scores</div>';
-  if (!window._fbFetch) {
+  if (!window._fbSubscribe) {
     list.innerHTML = '<div class="lb-empty">Firebase not loaded.</div>';
     return;
   }
-  const rows = await window._fbFetch(lbCurrentTab);
+  window._fbSubscribe(lbCurrentTab, (rows) => {
+    renderLeaderboard(rows);
+  });
+}
+
+function renderLeaderboard(rows){
+  const list = document.getElementById('lbList');
   if (!rows) {
     list.innerHTML = '<div class="lb-empty">Could not load leaderboard.<br>Check your connection.</div>';
     return;
